@@ -37,6 +37,33 @@ is_at_office() {
     fi
 }
 
+# Detect if the screen is locked
+is_screen_locked() {
+    case "$(uname -s)" in
+        Linux)
+            # Check GNOME/Cinnamon/MATE via DBus
+            if dbus-send --print-reply --dest=org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver.GetActive 2>/dev/null | grep -q "boolean true"; then
+                return 0
+            fi
+            # Check Freedesktop standard (KDE and others)
+            if dbus-send --print-reply --dest=org.freedesktop.ScreenSaver /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver.GetActive 2>/dev/null | grep -q "boolean true"; then
+                return 0
+            fi
+            return 1
+            ;;
+        Darwin)
+            # macOS: Check if the loginwindow is the frontmost app or use python to check Quartz
+            if python3 -c 'import sys, Quartz; d=Quartz.CGSessionCopyCurrentDictionary(); sys.exit(0 if d and d.get("CGSSessionScreenIsLocked") else 1)' 2>/dev/null; then
+                return 0
+            fi
+            return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # Cross-platform timeout wrapper
 run_with_timeout() {
     if command -v timeout &>/dev/null; then
@@ -109,6 +136,12 @@ main() {
             # Only log if at office desk
             if ! is_at_office; then
                 echo "Not at office desk, skipping log"
+                exit 0
+            fi
+
+            # Skip logging if screen is locked (away from computer)
+            if is_screen_locked; then
+                echo "Screen is locked, skipping log"
                 exit 0
             fi
 
