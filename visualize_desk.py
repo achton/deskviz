@@ -44,16 +44,22 @@ def load_data(filename):
         for row in reader:
             timestamp = datetime.fromisoformat(row["timestamp"])
             height = int(row["height_mm"])
-            is_standing = height >= STANDING_THRESHOLD
-            data.append(
-                {"timestamp": timestamp, "height": height, "is_standing": is_standing}
-            )
+
+            # States: 1 = standing, 0 = sitting, -1 = away
+            if height == 0:
+                state = -1
+            elif height >= STANDING_THRESHOLD:
+                state = 1
+            else:
+                state = 0
+
+            data.append({"timestamp": timestamp, "height": height, "state": state})
     return data
 
 
 def calculate_durations(data):
     """
-    Calculate standing/sitting durations between measurements.
+    Calculate durations between measurements.
     Assumes the state persists until the next measurement.
     """
     durations = []
@@ -73,7 +79,7 @@ def calculate_durations(data):
                     "start": current["timestamp"],
                     "end": next_entry["timestamp"],
                     "duration_min": duration,
-                    "is_standing": current["is_standing"],
+                    "state": current["state"],
                     "height": current["height"],
                 }
             )
@@ -82,14 +88,16 @@ def calculate_durations(data):
 
 def aggregate_by_day(durations):
     """Aggregate durations by day."""
-    daily = defaultdict(lambda: {"standing": 0, "sitting": 0, "entries": []})
+    daily = defaultdict(lambda: {"standing": 0, "sitting": 0, "away": 0, "entries": []})
 
     for d in durations:
         day = d["start"].date()
-        if d["is_standing"]:
+        if d["state"] == 1:
             daily[day]["standing"] += d["duration_min"]
-        else:
+        elif d["state"] == 0:
             daily[day]["sitting"] += d["duration_min"]
+        else:
+            daily[day]["away"] += d["duration_min"]
         daily[day]["entries"].append(d)
 
     return daily
@@ -102,6 +110,7 @@ def create_visualization(data, durations, daily_stats):
     # Color scheme
     standing_color = "#2ecc71"  # green
     sitting_color = "#e74c3c"  # red
+    away_color = "#bdc3c7"  # gray
 
     # --- Plot 1: Daily standing vs sitting bar chart ---
     ax1 = fig.add_subplot(2, 1, 1)
@@ -173,7 +182,14 @@ def create_visualization(data, durations, daily_stats):
         for entry in entries:
             start_hour = entry["start"].hour + entry["start"].minute / 60
             duration_hours = entry["duration_min"] / 60
-            color = standing_color if entry["is_standing"] else sitting_color
+
+            if entry["state"] == 1:
+                color = standing_color
+            elif entry["state"] == 0:
+                color = sitting_color
+            else:
+                color = away_color
+
             ax2.barh(
                 idx,
                 duration_hours,
@@ -188,7 +204,7 @@ def create_visualization(data, durations, daily_stats):
     ax2.set_yticklabels([d.strftime("%a %m/%d") for d in days])
     ax2.set_xlabel("Hour of Day")
     ax2.set_title(
-        "Daily Timeline (Standing = Green, Sitting = Red)",
+        "Daily Timeline (Standing=Green, Sitting=Red, Away=Gray)",
         fontsize=14,
         fontweight="bold",
     )
@@ -202,6 +218,7 @@ def create_visualization(data, durations, daily_stats):
     legend_elements = [
         Patch(facecolor=standing_color, label="Standing"),
         Patch(facecolor=sitting_color, label="Sitting"),
+        Patch(facecolor=away_color, label="Away/Locked"),
     ]
     ax2.legend(handles=legend_elements, loc="upper right")
 

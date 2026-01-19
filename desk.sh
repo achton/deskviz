@@ -139,15 +139,15 @@ main() {
                 exit 0
             fi
 
-            # Skip logging if screen is locked (away from computer)
+            # Log 0 height if screen is locked (away from computer)
             if is_screen_locked; then
-                echo "Screen is locked, skipping log"
-                exit 0
+                echo "Screen is locked, logging as Away (0mm)"
+                height=0
+            else
+                local output
+                output=$(run_with_timeout "${LINAK_CONTROLLER}" 2>&1)
+                height=$(extract_height "${output}")
             fi
-
-            local output height
-            output=$(run_with_timeout "${LINAK_CONTROLLER}" 2>&1)
-            height=$(extract_height "${output}")
 
             if [[ -n "${height}" ]]; then
                 echo "Current height: ${height}mm"
