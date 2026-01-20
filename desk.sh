@@ -10,7 +10,6 @@ set -euo pipefail
 # Configuration
 DEFAULT_CSV_FILE="${HOME}/desk.csv"
 OFFICE_ETH_MAC=""      # Office ethernet dongle MAC address (empty = always log)
-LINAK_CONTROLLER="/mnt/c/Users/Jacob/AppData/Local/Packages/PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0/LocalCache/local-packages/Python313/Scripts/linak-controller.exe"
 DESK_MAC="C9:C0:CD:A9:D3:5A"
 STANDING_HEIGHT=1040   # mm
 SITTING_HEIGHT=797     # mm
@@ -20,8 +19,18 @@ TIMEOUT_SECONDS=60
 SERVER_PORT=9123
 SERVER_PID_FILE="${HOME}/.desk-server.pid"
 
-# Windows path for linak-controller (for PowerShell commands)
-LINAK_CONTROLLER_WIN="C:\\Users\\Jacob\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\Scripts\\linak-controller.exe"
+# Detect platform and set appropriate paths
+if grep -qi microsoft /proc/version 2>/dev/null; then
+    # WSL - use Windows linak-controller
+    IS_WSL=true
+    LINAK_CONTROLLER="/mnt/c/Users/Jacob/AppData/Local/Packages/PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0/LocalCache/local-packages/Python313/Scripts/linak-controller.exe"
+    LINAK_CONTROLLER_WIN="C:\\Users\\Jacob\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\Scripts\\linak-controller.exe"
+else
+    # Native Linux/macOS - use local linak-controller
+    IS_WSL=false
+    LINAK_CONTROLLER="${HOME}/.local/bin/linak-controller"
+    LINAK_CONTROLLER_WIN=""  # Not used on native Linux
+fi
 
 # Show usage information
 usage() {
@@ -41,11 +50,22 @@ usage() {
     exit 1
 }
 
-# Check if the server is running by testing the TCP port on Windows
+# Check if the server is running by testing the TCP port
 is_server_running() {
-    # Check if Windows is listening on the server port
-    powershell.exe -Command "Test-NetConnection -ComputerName localhost -Port ${SERVER_PORT} -InformationLevel Quiet" 2>/dev/null | grep -qi "true"
-    return $?
+    if [[ "${IS_WSL}" == "true" ]]; then
+        # WSL: Check if Windows is listening on the server port
+        powershell.exe -Command "Test-NetConnection -ComputerName localhost -Port ${SERVER_PORT} -InformationLevel Quiet" 2>/dev/null | grep -qi "true"
+        return $?
+    else
+        # Native Linux: Use nc or /dev/tcp
+        if command -v nc &>/dev/null; then
+            nc -z localhost "${SERVER_PORT}" 2>/dev/null
+            return $?
+        else
+            (echo > /dev/tcp/localhost/"${SERVER_PORT}") 2>/dev/null
+            return $?
+        fi
+    fi
 }
 
 # Start the server in background
@@ -58,9 +78,14 @@ start_server() {
     echo "Starting desk server on port ${SERVER_PORT}..."
     echo "Connecting to desk (this may take a moment)..."
     
-    # Start the server in background using PowerShell (so it runs as Windows process)
-    # Use --server (WebSocket) not --tcp-server, as --forward expects WebSocket
-    powershell.exe -Command "Start-Process -FilePath '${LINAK_CONTROLLER_WIN}' -ArgumentList '--mac-address','${DESK_MAC}','--server','--server-port','${SERVER_PORT}'" &>/dev/null
+    if [[ "${IS_WSL}" == "true" ]]; then
+        # WSL: Start the server using PowerShell (so it runs as Windows process)
+        powershell.exe -Command "Start-Process -FilePath '${LINAK_CONTROLLER_WIN}' -ArgumentList '--mac-address','${DESK_MAC}','--server','--server-port','${SERVER_PORT}'" &>/dev/null
+    else
+        # Native Linux: Start server in background
+        nohup "${LINAK_CONTROLLER}" --mac-address "${DESK_MAC}" --server --server-port "${SERVER_PORT}" > /dev/null 2>&1 &
+        echo $! > "${SERVER_PID_FILE}"
+    fi
     
     # Wait for server to start (needs time to connect to desk via Bluetooth)
     local retries=30
@@ -77,7 +102,6 @@ start_server() {
     done
     
     echo "Failed to start server (timeout after ${retries}s)" >&2
-    echo "Check if a terminal window opened with an error." >&2
     return 1
 }
 
@@ -90,8 +114,18 @@ stop_server() {
     
     echo "Stopping desk server..."
     
-    # Find and kill the linak-controller process on Windows
-    powershell.exe -Command "Get-Process | Where-Object { \$_.ProcessName -like '*linak*' } | Stop-Process -Force" 2>/dev/null || true
+    if [[ "${IS_WSL}" == "true" ]]; then
+        # WSL: Kill the linak-controller process on Windows
+        powershell.exe -Command "Get-Process | Where-Object { \$_.ProcessName -like '*linak*' } | Stop-Process -Force" 2>/dev/null || true
+    else
+        # Native Linux: Kill using PID file or pkill
+        if [[ -f "${SERVER_PID_FILE}" ]]; then
+            kill "$(cat "${SERVER_PID_FILE}")" 2>/dev/null || true
+            rm -f "${SERVER_PID_FILE}"
+        else
+            pkill -f "linak-controller.*--server" 2>/dev/null || true
+        fi
+    fi
     
     sleep 1
     
@@ -119,8 +153,13 @@ get_current_height() {
     for ((i=1; i<=retries; i++)); do
         start_time=$(date +%s.%N)
         if [[ "${use_server}" == "true" ]]; then
-            # Run via PowerShell to use Windows localhost
-            output=$(powershell.exe -Command "& '${LINAK_CONTROLLER_WIN}' --mac-address '${DESK_MAC}' --forward --server-address localhost --server-port ${SERVER_PORT}" 2>&1) || true
+            if [[ "${IS_WSL}" == "true" ]]; then
+                # WSL: Run via PowerShell to use Windows localhost
+                output=$(powershell.exe -Command "& '${LINAK_CONTROLLER_WIN}' --mac-address '${DESK_MAC}' --forward --server-address localhost --server-port ${SERVER_PORT}" 2>&1) || true
+            else
+                # Native Linux: Connect directly
+                output=$("${LINAK_CONTROLLER}" --mac-address "${DESK_MAC}" --forward --server-address localhost --server-port "${SERVER_PORT}" 2>&1) || true
+            fi
         else
             output=$(run_with_timeout "${LINAK_CONTROLLER}" --mac-address "${DESK_MAC}" 2>&1) || true
         fi
@@ -174,12 +213,22 @@ move_to_height() {
     for ((i=1; i<=retries; i++)); do
         start_time=$(date +%s.%N)
         if [[ "${use_server}" == "true" ]]; then
-            # Run via PowerShell to use Windows localhost
-            if powershell.exe -Command "& '${LINAK_CONTROLLER_WIN}' --mac-address '${DESK_MAC}' --forward --server-address localhost --server-port ${SERVER_PORT} --move-to ${target_height}" 2>&1; then
-                end_time=$(date +%s.%N)
-                duration=$(echo "${end_time} - ${start_time}" | bc)
-                echo "Completed in ${duration}s (server mode)"
-                return 0
+            if [[ "${IS_WSL}" == "true" ]]; then
+                # WSL: Run via PowerShell to use Windows localhost
+                if powershell.exe -Command "& '${LINAK_CONTROLLER_WIN}' --mac-address '${DESK_MAC}' --forward --server-address localhost --server-port ${SERVER_PORT} --move-to ${target_height}" 2>&1; then
+                    end_time=$(date +%s.%N)
+                    duration=$(echo "${end_time} - ${start_time}" | bc)
+                    echo "Completed in ${duration}s (server mode)"
+                    return 0
+                fi
+            else
+                # Native Linux: Connect directly
+                if "${LINAK_CONTROLLER}" --mac-address "${DESK_MAC}" --forward --server-address localhost --server-port "${SERVER_PORT}" --move-to "${target_height}" 2>&1; then
+                    end_time=$(date +%s.%N)
+                    duration=$(echo "${end_time} - ${start_time}" | bc)
+                    echo "Completed in ${duration}s (server mode)"
+                    return 0
+                fi
             fi
         else
             if run_with_timeout "${LINAK_CONTROLLER}" --mac-address "${DESK_MAC}" --move-to "${target_height}" 2>&1; then
