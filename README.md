@@ -19,7 +19,7 @@ The `desk.sh` script controls the desk and logs height data:
 ```bash
 ./desk.sh stand    # Move desk to standing position
 ./desk.sh sit      # Move desk to sitting position
-./desk.sh status   # Log current height to CSV
+./desk.sh status   # Log current height to CSV (or 0mm if screen is locked)
 ```
 
 By default, data is logged to `~/desk.csv`. Use `-f` to specify a different file:
@@ -45,6 +45,8 @@ To configure for your setup:
 3. Update `OFFICE_ETH_MAC` in `desk.sh`
 
 This works cross-platform (Linux and macOS) and prevents logging when working from home or elsewhere.
+
+Additionally, when the screen is locked, the script logs an "away" state (0mm) instead of the actual desk height. Screen lock is detected via DBus on Linux (GNOME, KDE, etc.) and Quartz on macOS.
 
 ### Automated Logging
 
@@ -74,7 +76,7 @@ timestamp,height_mm
 ```
 
 - `timestamp`: ISO 8601 datetime
-- `height_mm`: Desk height in millimeters (>=900mm = standing, <900mm = sitting)
+- `height_mm`: Desk height in millimeters (>=900mm = standing, <900mm = sitting, 0mm = away/screen locked)
 
 ## Example Output
 
@@ -82,4 +84,4 @@ timestamp,height_mm
 
 The visualization shows:
 - **Top**: Daily comparison of standing vs sitting time (minutes)
-- **Bottom**: Timeline view of each day showing standing (green) and sitting (red) periods
+- **Bottom**: Timeline view of each day showing standing (green), sitting (red), and away/locked (gray) periods
