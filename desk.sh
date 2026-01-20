@@ -16,14 +16,23 @@ STANDING_HEIGHT=1040   # mm
 SITTING_HEIGHT=797     # mm
 TIMEOUT_SECONDS=60
 
+# Server mode configuration
+SERVER_PORT=9123
+SERVER_PID_FILE="${HOME}/.desk-server.pid"
+
+# Windows path for linak-controller (for PowerShell commands)
+LINAK_CONTROLLER_WIN="C:\\Users\\Jacob\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\Scripts\\linak-controller.exe"
+
 # Show usage information
 usage() {
-    echo "Usage: $(basename "$0") [-f CSV_FILE] {stand|sit|status} [--save]" >&2
+    echo "Usage: $(basename "$0") [-f CSV_FILE] <command> [options]" >&2
     echo "" >&2
     echo "Options:" >&2
     echo "  -f CSV_FILE    Path to CSV file (default: ~/desk.csv)" >&2
     echo "" >&2
     echo "Commands:" >&2
+    echo "  connect        Start persistent server (faster subsequent commands)" >&2
+    echo "  disconnect     Stop the persistent server" >&2
     echo "  stand          Move desk to standing position (${STANDING_HEIGHT}mm)" >&2
     echo "  sit            Move desk to sitting position (${SITTING_HEIGHT}mm)" >&2
     echo "  stand --save   Save current height as new standing default" >&2
@@ -32,19 +41,99 @@ usage() {
     exit 1
 }
 
+# Check if the server is running by testing the TCP port on Windows
+is_server_running() {
+    # Check if Windows is listening on the server port
+    powershell.exe -Command "Test-NetConnection -ComputerName localhost -Port ${SERVER_PORT} -InformationLevel Quiet" 2>/dev/null | grep -qi "true"
+    return $?
+}
+
+# Start the server in background
+start_server() {
+    if is_server_running; then
+        echo "Server already running on port ${SERVER_PORT}"
+        return 0
+    fi
+    
+    echo "Starting desk server on port ${SERVER_PORT}..."
+    echo "Connecting to desk (this may take a moment)..."
+    
+    # Start the server in background using PowerShell (so it runs as Windows process)
+    # Use --server (WebSocket) not --tcp-server, as --forward expects WebSocket
+    powershell.exe -Command "Start-Process -FilePath '${LINAK_CONTROLLER_WIN}' -ArgumentList '--mac-address','${DESK_MAC}','--server','--server-port','${SERVER_PORT}'" &>/dev/null
+    
+    # Wait for server to start (needs time to connect to desk via Bluetooth)
+    local retries=30
+    for ((i=1; i<=retries; i++)); do
+        sleep 1
+        if is_server_running; then
+            echo "Server started successfully (port ${SERVER_PORT})"
+            echo "Desk is now connected. Commands will be fast!"
+            return 0
+        fi
+        if (( i % 5 == 0 )); then
+            echo "Still connecting... ($i/$retries)"
+        fi
+    done
+    
+    echo "Failed to start server (timeout after ${retries}s)" >&2
+    echo "Check if a terminal window opened with an error." >&2
+    return 1
+}
+
+# Stop the server
+stop_server() {
+    if ! is_server_running; then
+        echo "Server is not running"
+        return 0
+    fi
+    
+    echo "Stopping desk server..."
+    
+    # Find and kill the linak-controller process on Windows
+    powershell.exe -Command "Get-Process | Where-Object { \$_.ProcessName -like '*linak*' } | Stop-Process -Force" 2>/dev/null || true
+    
+    sleep 1
+    
+    if is_server_running; then
+        echo "Warning: Server may still be running" >&2
+        return 1
+    fi
+    
+    echo "Server stopped"
+    return 0
+}
+
 # Get current desk height
 get_current_height() {
     local output height retries=3
     local start_time end_time duration
+    local use_server=false
+    
+    # Use server mode if available
+    if is_server_running; then
+        use_server=true
+        retries=1  # Server mode is reliable, no need for retries
+    fi
+    
     for ((i=1; i<=retries; i++)); do
         start_time=$(date +%s.%N)
-        output=$(run_with_timeout "${LINAK_CONTROLLER}" --mac-address "${DESK_MAC}" 2>&1) || true
+        if [[ "${use_server}" == "true" ]]; then
+            # Run via PowerShell to use Windows localhost
+            output=$(powershell.exe -Command "& '${LINAK_CONTROLLER_WIN}' --mac-address '${DESK_MAC}' --forward --server-address localhost --server-port ${SERVER_PORT}" 2>&1) || true
+        else
+            output=$(run_with_timeout "${LINAK_CONTROLLER}" --mac-address "${DESK_MAC}" 2>&1) || true
+        fi
         height=$(extract_height "${output}")
         if [[ -n "${height}" ]]; then
             end_time=$(date +%s.%N)
             duration=$(echo "${end_time} - ${start_time}" | bc)
             echo "${height}"
-            echo "Connected in ${duration}s" >&2
+            if [[ "${use_server}" == "true" ]]; then
+                echo "Server mode: ${duration}s" >&2
+            else
+                echo "Direct connection: ${duration}s" >&2
+            fi
             return 0
         fi
         end_time=$(date +%s.%N)
@@ -74,14 +163,31 @@ move_to_height() {
     local target_height="$1"
     local retries=3
     local start_time end_time duration
+    local use_server=false
+    
+    # Use server mode if available
+    if is_server_running; then
+        use_server=true
+        retries=1  # Server mode is reliable, no need for retries
+    fi
     
     for ((i=1; i<=retries; i++)); do
         start_time=$(date +%s.%N)
-        if run_with_timeout "${LINAK_CONTROLLER}" --mac-address "${DESK_MAC}" --move-to "${target_height}" 2>&1; then
-            end_time=$(date +%s.%N)
-            duration=$(echo "${end_time} - ${start_time}" | bc)
-            echo "Completed in ${duration}s"
-            return 0
+        if [[ "${use_server}" == "true" ]]; then
+            # Run via PowerShell to use Windows localhost
+            if powershell.exe -Command "& '${LINAK_CONTROLLER_WIN}' --mac-address '${DESK_MAC}' --forward --server-address localhost --server-port ${SERVER_PORT} --move-to ${target_height}" 2>&1; then
+                end_time=$(date +%s.%N)
+                duration=$(echo "${end_time} - ${start_time}" | bc)
+                echo "Completed in ${duration}s (server mode)"
+                return 0
+            fi
+        else
+            if run_with_timeout "${LINAK_CONTROLLER}" --mac-address "${DESK_MAC}" --move-to "${target_height}" 2>&1; then
+                end_time=$(date +%s.%N)
+                duration=$(echo "${end_time} - ${start_time}" | bc)
+                echo "Completed in ${duration}s (direct)"
+                return 0
+            fi
         fi
         end_time=$(date +%s.%N)
         duration=$(echo "${end_time} - ${start_time}" | bc)
@@ -206,6 +312,12 @@ main() {
     local flag="${2:-}"
 
     case "${cmd}" in
+        connect)
+            start_server
+            ;;
+        disconnect)
+            stop_server
+            ;;
         stand)
             if [[ "${flag}" == "--save" ]]; then
                 local current_height
