@@ -12,7 +12,7 @@ DEFAULT_CSV_FILE="${HOME}/desk.csv"
 OFFICE_ETH_MAC=""      # Office ethernet dongle MAC address (empty = always log)
 DESK_MAC="C9:C0:CD:A9:D3:5A"
 STANDING_HEIGHT=1040   # mm
-SITTING_HEIGHT=797     # mm
+SITTING_HEIGHT=774     # mm
 TIMEOUT_SECONDS=60
 
 # Server mode configuration
