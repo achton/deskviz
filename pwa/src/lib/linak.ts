@@ -41,6 +41,7 @@ export class LinakDesk {
   private server: BluetoothRemoteGATTServer | null = null;
   private positionChar: BluetoothRemoteGATTCharacteristic | null = null;
   private controlChar: BluetoothRemoteGATTCharacteristic | null = null;
+  private refInputChar: BluetoothRemoteGATTCharacteristic | null = null;
   private dpgChar: BluetoothRemoteGATTCharacteristic | null = null;
 
   private onHeightChange: HeightCallback | null = null;
@@ -50,6 +51,7 @@ export class LinakDesk {
   private isMoving = false;
   private hasStartedMoving = false;
   private targetHeight = 0;
+  private currentSpeedRaw = 0; // Speed in raw units (0.1mm/s)
 
   constructor() {
     // Check Web Bluetooth support
@@ -160,6 +162,7 @@ export class LinakDesk {
         this.server = null;
         this.positionChar = null;
         this.controlChar = null;
+        this.refInputChar = null;
         this.dpgChar = null;
 
         // If not the last attempt, wait before retrying
@@ -213,6 +216,15 @@ export class LinakDesk {
     this.controlChar = await controlService.getCharacteristic(CONTROL_CHAR_UUID);
 
     console.log('Control characteristic properties:', this.controlChar.properties);
+
+    // Get reference input service and characteristic for absolute positioning
+    try {
+      const refInputService = await this.server.getPrimaryService(REFERENCE_INPUT_SERVICE_UUID);
+      this.refInputChar = await refInputService.getCharacteristic(REFERENCE_INPUT_CHAR_UUID);
+      console.log('Reference Input characteristic found');
+    } catch (e) {
+      console.warn('Could not access Reference Input service:', e);
+    }
 
     // Get DPG service and characteristic for user ID activation
     try {
@@ -322,6 +334,7 @@ export class LinakDesk {
     this.server = null;
     this.positionChar = null;
     this.controlChar = null;
+    this.refInputChar = null;
     this.dpgChar = null;
     this.isMoving = false;
     this.hasStartedMoving = false;
@@ -360,21 +373,15 @@ export class LinakDesk {
     const heightMm = this.baseHeight + Math.round(positionRaw / 10);
     const speedMmPerSec = Math.round(speedRaw / 10);
 
-    // Track current height for moveTo
+    // Track current height and speed for moveTo
     this.currentHeightMm = heightMm;
+    this.currentSpeedRaw = speedRaw;
 
     this.onHeightChange?.(heightMm, speedMmPerSec);
 
     // Track if desk has started moving
     if (this.isMoving && Math.abs(speedRaw) > 0) {
       this.hasStartedMoving = true;
-    }
-
-    // Only stop when speed becomes 0 AFTER the desk started moving
-    if (this.isMoving && this.hasStartedMoving && speedRaw === 0) {
-      console.log('Movement complete - desk stopped');
-      this.isMoving = false;
-      this.hasStartedMoving = false;
     }
   }
 
@@ -394,9 +401,21 @@ export class LinakDesk {
 
   private currentHeightMm = 0;
 
+  /**
+   * Move the desk to the specified height using the Reference Input method.
+   * This replicates the linak-controller Python implementation:
+   * 1. Wake up the desk
+   * 2. Send stop command
+   * 3. Loop: send target height to Reference Input until speed becomes 0
+   * 4. Send final stop command
+   */
   async moveTo(heightMm: number): Promise<boolean> {
-    if (!this.controlChar || !this.server?.connected) {
-      console.error('Not connected');
+    if (!this.controlChar || !this.refInputChar || !this.server?.connected) {
+      console.error('Not connected or Reference Input not available');
+      // Fallback to up/down commands if Reference Input not available
+      if (this.controlChar && this.server?.connected) {
+        return this.moveToFallback(heightMm);
+      }
       return false;
     }
 
@@ -405,7 +424,7 @@ export class LinakDesk {
       await this.readPosition();
     }
 
-    const tolerance = 5; // mm tolerance for "already at target"
+    const tolerance = 2; // mm tolerance (linak-controller uses 1mm)
 
     // Already at target?
     if (Math.abs(this.currentHeightMm - heightMm) <= tolerance) {
@@ -413,61 +432,125 @@ export class LinakDesk {
       return true;
     }
 
-    // Determine direction
+    console.log(`Moving from ${this.currentHeightMm}mm to ${heightMm}mm`);
+
+    try {
+      // 1. Wake up the desk
+      await this.controlChar.writeValueWithoutResponse(new Uint8Array([0x01, 0x00]));
+      console.log('Wakeup sent');
+
+      // 2. Send stop command (clear any previous state)
+      await this.controlChar.writeValueWithoutResponse(new Uint8Array([CMD_STOP, 0x00]));
+      await delay(100);
+
+      // Calculate raw target value for Reference Input
+      // Reference Input expects raw position value (without base height) in 0.1mm units
+      const targetRaw = (heightMm - this.baseHeight) * 10;
+      const targetData = new Uint8Array(2);
+      targetData[0] = targetRaw & 0xff; // Low byte
+      targetData[1] = (targetRaw >> 8) & 0xff; // High byte
+
+      console.log(
+        `Target: ${heightMm}mm (raw: ${targetRaw}) = [0x${targetData[0].toString(16)}, 0x${targetData[1].toString(16)}]`
+      );
+
+      this.isMoving = true;
+      this.hasStartedMoving = false;
+      this.targetHeight = heightMm;
+
+      // 3. Loop: send target height to Reference Input until speed becomes 0
+      const moveCommandPeriod = 400; // ms (linak-controller default)
+      const maxIterations = 150; // Safety limit (~60 seconds)
+
+      for (let i = 0; i < maxIterations; i++) {
+        // Check if cancelled
+        if (!this.isMoving || !this.server?.connected) {
+          console.log(`Movement cancelled after ${i} iterations`);
+          break;
+        }
+
+        // Send target height to Reference Input
+        await this.refInputChar.writeValueWithoutResponse(targetData);
+
+        // Wait for the command period
+        await delay(moveCommandPeriod);
+
+        // Log progress
+        const speedMm = Math.round(this.currentSpeedRaw / 10);
+        if (i < 3 || i % 5 === 0 || this.currentSpeedRaw === 0) {
+          console.log(`Height: ${this.currentHeightMm}mm Speed: ${speedMm}mm/s`);
+        }
+
+        // Track if desk has started moving
+        if (Math.abs(this.currentSpeedRaw) > 0) {
+          this.hasStartedMoving = true;
+        }
+
+        // Check if movement is complete (speed is 0 after desk started moving)
+        if (this.hasStartedMoving && this.currentSpeedRaw === 0) {
+          console.log('Movement complete - desk stopped');
+          break;
+        }
+      }
+
+      // 4. Send final stop command
+      await this.controlChar.writeValueWithoutResponse(new Uint8Array([CMD_STOP, 0x00]));
+
+      this.isMoving = false;
+      this.hasStartedMoving = false;
+      console.log(`Final height: ${this.currentHeightMm}mm (Target: ${heightMm}mm)`);
+      return true;
+    } catch (error) {
+      console.error('Move failed:', error);
+      this.isMoving = false;
+      this.hasStartedMoving = false;
+      // Try to send stop on error
+      try {
+        await this.controlChar.writeValueWithoutResponse(new Uint8Array([CMD_STOP, 0x00]));
+      } catch {
+        // Ignore
+      }
+      return false;
+    }
+  }
+
+  /**
+   * Fallback movement using up/down commands (if Reference Input not available)
+   */
+  private async moveToFallback(heightMm: number): Promise<boolean> {
+    if (!this.controlChar || !this.server?.connected) {
+      return false;
+    }
+
+    const tolerance = 5;
+    if (Math.abs(this.currentHeightMm - heightMm) <= tolerance) {
+      return true;
+    }
+
     const direction = heightMm > this.currentHeightMm ? 'up' : 'down';
     const commandByte = direction === 'up' ? CMD_MOVE_UP : CMD_MOVE_DOWN;
     const command = new Uint8Array([commandByte, 0x00]);
 
-    console.log(`Moving ${direction} from ${this.currentHeightMm}mm to ${heightMm}mm`);
+    console.log(`Moving ${direction} (fallback) from ${this.currentHeightMm}mm to ${heightMm}mm`);
 
-    // Send wakeup command first (desk may have gone to sleep)
-    try {
-      await this.controlChar.writeValueWithoutResponse(new Uint8Array([CMD_WAKEUP, 0x00]));
-      console.log('Wakeup sent');
-      await delay(200); // Brief delay for desk to wake up
-    } catch (err) {
-      console.warn('Wakeup command failed:', err);
-    }
+    // Wakeup
+    await this.controlChar.writeValueWithoutResponse(new Uint8Array([CMD_WAKEUP, 0x00]));
+    await delay(200);
 
     this.isMoving = true;
-    this.targetHeight = heightMm;
 
-    // Simple loop - send commands until we reach the target
-    // This matches exactly what worked in the console tests
-    const maxCommands = 500; // Safety limit (~50 seconds at 100ms intervals)
-    const commandInterval = 100; // ms between commands
+    for (let i = 0; i < 500; i++) {
+      if (!this.isMoving || !this.server?.connected) break;
 
-    for (let i = 0; i < maxCommands; i++) {
-      // Check if we should stop
-      if (!this.isMoving || !this.controlChar || !this.server?.connected) {
-        console.log(`Movement cancelled after ${i} commands`);
-        break;
-      }
-
-      // Check if we've reached the target
-      const reachedTarget =
+      const reached =
         direction === 'up'
           ? this.currentHeightMm >= heightMm - tolerance
           : this.currentHeightMm <= heightMm + tolerance;
 
-      if (reachedTarget) {
-        console.log(`Target reached at ${this.currentHeightMm}mm after ${i} commands`);
-        break;
-      }
+      if (reached) break;
 
-      // Send the command
-      try {
-        await this.controlChar.writeValueWithoutResponse(command);
-        if (i < 5 || i % 20 === 0) {
-          console.log(`Cmd ${i + 1}: height=${this.currentHeightMm}mm, target=${heightMm}mm`);
-        }
-      } catch (err) {
-        console.error('Write error:', err);
-        break;
-      }
-
-      // Wait before sending next command
-      await delay(commandInterval);
+      await this.controlChar.writeValueWithoutResponse(command);
+      await delay(100);
     }
 
     this.isMoving = false;
