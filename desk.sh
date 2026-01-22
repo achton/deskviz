@@ -2,33 +2,259 @@
 #
 # desk.sh - Control and log standing desk height
 #
-# Usage: desk.sh [-f CSV_FILE] {stand|sit|status}
+# Usage: desk.sh [-f CSV_FILE] {stand|sit|status} [--save]
 #
 
 set -euo pipefail
 
 # Configuration
 DEFAULT_CSV_FILE="${HOME}/desk.csv"
-OFFICE_ETH_MAC="20:7b:d2:97:e4:74"      # Office ethernet dongle MAC address
-LINAK_CONTROLLER="${HOME}/.local/bin/linak-controller"
-TIMEOUT_SECONDS=30
+OFFICE_ETH_MAC=""      # Office ethernet dongle MAC address (empty = always log)
+DESK_MAC="C9:C0:CD:A9:D3:5A"
+STANDING_HEIGHT=1040   # mm
+SITTING_HEIGHT=797     # mm
+TIMEOUT_SECONDS=60
+
+# Server mode configuration
+SERVER_PORT=9123
+SERVER_PID_FILE="${HOME}/.desk-server.pid"
+
+# Detect platform and set appropriate paths
+if grep -qi microsoft /proc/version 2>/dev/null; then
+    # WSL - use Windows linak-controller
+    IS_WSL=true
+    LINAK_CONTROLLER="/mnt/c/Users/Jacob/AppData/Local/Packages/PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0/LocalCache/local-packages/Python313/Scripts/linak-controller.exe"
+    LINAK_CONTROLLER_WIN="C:\\Users\\Jacob\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\Scripts\\linak-controller.exe"
+else
+    # Native Linux/macOS - use local linak-controller
+    IS_WSL=false
+    LINAK_CONTROLLER="${HOME}/.local/bin/linak-controller"
+    LINAK_CONTROLLER_WIN=""  # Not used on native Linux
+fi
 
 # Show usage information
 usage() {
-    echo "Usage: $(basename "$0") [-f CSV_FILE] {stand|sit|status}" >&2
+    echo "Usage: $(basename "$0") [-f CSV_FILE] <command> [options]" >&2
     echo "" >&2
     echo "Options:" >&2
     echo "  -f CSV_FILE    Path to CSV file (default: ~/desk.csv)" >&2
     echo "" >&2
     echo "Commands:" >&2
-    echo "  stand          Move desk to standing position" >&2
-    echo "  sit            Move desk to sitting position" >&2
+    echo "  connect        Start persistent server (faster subsequent commands)" >&2
+    echo "  disconnect     Stop the persistent server" >&2
+    echo "  stand          Move desk to standing position (${STANDING_HEIGHT}mm)" >&2
+    echo "  sit            Move desk to sitting position (${SITTING_HEIGHT}mm)" >&2
+    echo "  stand --save   Save current height as new standing default" >&2
+    echo "  sit --save     Save current height as new sitting default" >&2
     echo "  status         Log current height to CSV" >&2
     exit 1
 }
 
+# Check if the server is running by testing the TCP port
+is_server_running() {
+    if [[ "${IS_WSL}" == "true" ]]; then
+        # WSL: Check if Windows is listening on the server port
+        powershell.exe -Command "Test-NetConnection -ComputerName localhost -Port ${SERVER_PORT} -InformationLevel Quiet" 2>/dev/null | grep -qi "true"
+        return $?
+    else
+        # Native Linux: Use nc or /dev/tcp
+        if command -v nc &>/dev/null; then
+            nc -z localhost "${SERVER_PORT}" 2>/dev/null
+            return $?
+        else
+            (echo > /dev/tcp/localhost/"${SERVER_PORT}") 2>/dev/null
+            return $?
+        fi
+    fi
+}
+
+# Start the server in background
+start_server() {
+    if is_server_running; then
+        echo "Server already running on port ${SERVER_PORT}"
+        return 0
+    fi
+    
+    echo "Starting desk server on port ${SERVER_PORT}..."
+    echo "Connecting to desk (this may take a moment)..."
+    
+    if [[ "${IS_WSL}" == "true" ]]; then
+        # WSL: Start the server using PowerShell (so it runs as Windows process)
+        powershell.exe -Command "Start-Process -FilePath '${LINAK_CONTROLLER_WIN}' -ArgumentList '--mac-address','${DESK_MAC}','--server','--server-port','${SERVER_PORT}'" &>/dev/null
+    else
+        # Native Linux: Start server in background
+        nohup "${LINAK_CONTROLLER}" --mac-address "${DESK_MAC}" --server --server-port "${SERVER_PORT}" > /dev/null 2>&1 &
+        echo $! > "${SERVER_PID_FILE}"
+    fi
+    
+    # Wait for server to start (needs time to connect to desk via Bluetooth)
+    local retries=30
+    for ((i=1; i<=retries; i++)); do
+        sleep 1
+        if is_server_running; then
+            echo "Server started successfully (port ${SERVER_PORT})"
+            echo "Desk is now connected. Commands will be fast!"
+            return 0
+        fi
+        if (( i % 5 == 0 )); then
+            echo "Still connecting... ($i/$retries)"
+        fi
+    done
+    
+    echo "Failed to start server (timeout after ${retries}s)" >&2
+    return 1
+}
+
+# Stop the server
+stop_server() {
+    if ! is_server_running; then
+        echo "Server is not running"
+        return 0
+    fi
+    
+    echo "Stopping desk server..."
+    
+    if [[ "${IS_WSL}" == "true" ]]; then
+        # WSL: Kill the linak-controller process on Windows
+        powershell.exe -Command "Get-Process | Where-Object { \$_.ProcessName -like '*linak*' } | Stop-Process -Force" 2>/dev/null || true
+    else
+        # Native Linux: Kill using PID file or pkill
+        if [[ -f "${SERVER_PID_FILE}" ]]; then
+            kill "$(cat "${SERVER_PID_FILE}")" 2>/dev/null || true
+            rm -f "${SERVER_PID_FILE}"
+        else
+            pkill -f "linak-controller.*--server" 2>/dev/null || true
+        fi
+    fi
+    
+    sleep 1
+    
+    if is_server_running; then
+        echo "Warning: Server may still be running" >&2
+        return 1
+    fi
+    
+    echo "Server stopped"
+    return 0
+}
+
+# Get current desk height
+get_current_height() {
+    local output height retries=3
+    local start_time end_time duration
+    local use_server=false
+    
+    # Use server mode if available
+    if is_server_running; then
+        use_server=true
+        retries=1  # Server mode is reliable, no need for retries
+    fi
+    
+    for ((i=1; i<=retries; i++)); do
+        start_time=$(date +%s.%N)
+        if [[ "${use_server}" == "true" ]]; then
+            if [[ "${IS_WSL}" == "true" ]]; then
+                # WSL: Run via PowerShell to use Windows localhost
+                output=$(powershell.exe -Command "& '${LINAK_CONTROLLER_WIN}' --mac-address '${DESK_MAC}' --forward --server-address localhost --server-port ${SERVER_PORT}" 2>&1) || true
+            else
+                # Native Linux: Connect directly
+                output=$("${LINAK_CONTROLLER}" --mac-address "${DESK_MAC}" --forward --server-address localhost --server-port "${SERVER_PORT}" 2>&1) || true
+            fi
+        else
+            output=$(run_with_timeout "${LINAK_CONTROLLER}" --mac-address "${DESK_MAC}" 2>&1) || true
+        fi
+        height=$(extract_height "${output}")
+        if [[ -n "${height}" ]]; then
+            end_time=$(date +%s.%N)
+            duration=$(echo "${end_time} - ${start_time}" | bc)
+            echo "${height}"
+            if [[ "${use_server}" == "true" ]]; then
+                echo "Server mode: ${duration}s" >&2
+            else
+                echo "Direct connection: ${duration}s" >&2
+            fi
+            return 0
+        fi
+        end_time=$(date +%s.%N)
+        duration=$(echo "${end_time} - ${start_time}" | bc)
+        if [[ $i -lt $retries ]]; then
+            echo "Retry $i/$retries - failed after ${duration}s, waiting..." >&2
+            sleep 2
+        fi
+    done
+    return 1
+}
+
+# Save a new height to this script
+save_height() {
+    local position="$1"  # "STANDING" or "SITTING"
+    local new_height="$2"
+    local script_path
+    script_path="$(realpath "$0")"
+    
+    # Update the height in the script
+    sed -i "s/^${position}_HEIGHT=[0-9]*/${position}_HEIGHT=${new_height}/" "${script_path}"
+    echo "Saved ${position,,} height: ${new_height}mm"
+}
+
+# Move desk to target height with retries
+move_to_height() {
+    local target_height="$1"
+    local retries=3
+    local start_time end_time duration
+    local use_server=false
+    
+    # Use server mode if available
+    if is_server_running; then
+        use_server=true
+        retries=1  # Server mode is reliable, no need for retries
+    fi
+    
+    for ((i=1; i<=retries; i++)); do
+        start_time=$(date +%s.%N)
+        if [[ "${use_server}" == "true" ]]; then
+            if [[ "${IS_WSL}" == "true" ]]; then
+                # WSL: Run via PowerShell to use Windows localhost
+                if powershell.exe -Command "& '${LINAK_CONTROLLER_WIN}' --mac-address '${DESK_MAC}' --forward --server-address localhost --server-port ${SERVER_PORT} --move-to ${target_height}" 2>&1; then
+                    end_time=$(date +%s.%N)
+                    duration=$(echo "${end_time} - ${start_time}" | bc)
+                    echo "Completed in ${duration}s (server mode)"
+                    return 0
+                fi
+            else
+                # Native Linux: Connect directly
+                if "${LINAK_CONTROLLER}" --mac-address "${DESK_MAC}" --forward --server-address localhost --server-port "${SERVER_PORT}" --move-to "${target_height}" 2>&1; then
+                    end_time=$(date +%s.%N)
+                    duration=$(echo "${end_time} - ${start_time}" | bc)
+                    echo "Completed in ${duration}s (server mode)"
+                    return 0
+                fi
+            fi
+        else
+            if run_with_timeout "${LINAK_CONTROLLER}" --mac-address "${DESK_MAC}" --move-to "${target_height}" 2>&1; then
+                end_time=$(date +%s.%N)
+                duration=$(echo "${end_time} - ${start_time}" | bc)
+                echo "Completed in ${duration}s (direct)"
+                return 0
+            fi
+        fi
+        end_time=$(date +%s.%N)
+        duration=$(echo "${end_time} - ${start_time}" | bc)
+        if [[ $i -lt $retries ]]; then
+            echo "Retry $i/$retries - failed after ${duration}s, waiting..." >&2
+            sleep 3
+        fi
+    done
+    echo "Failed to move desk after ${retries} attempts" >&2
+    return 1
+}
+
 # Detect if at office desk by checking for ethernet dongle MAC address
 is_at_office() {
+    # If no MAC configured, always consider at office
+    if [[ -z "${OFFICE_ETH_MAC}" ]]; then
+        return 0
+    fi
     # Use ip (Linux) or ifconfig (macOS/BSD) to find the MAC
     if command -v ip &>/dev/null; then
         ip link 2>/dev/null | grep -iq "${OFFICE_ETH_MAC}"
@@ -66,7 +292,10 @@ is_screen_locked() {
 
 # Cross-platform timeout wrapper
 run_with_timeout() {
-    if command -v timeout &>/dev/null; then
+    # Skip timeout for Windows executables in WSL (can cause issues)
+    if [[ "$1" == *.exe ]]; then
+        "$@"
+    elif command -v timeout &>/dev/null; then
         timeout -s SIGTERM "${TIMEOUT_SECONDS}" "$@"
     elif command -v gtimeout &>/dev/null; then
         # macOS with coreutils installed via Homebrew
@@ -124,13 +353,37 @@ main() {
     done
     shift $((OPTIND - 1))
 
-    if [[ $# -ne 1 ]]; then
+    if [[ $# -lt 1 || $# -gt 2 ]]; then
         usage
     fi
 
-    case "$1" in
-        stand|sit)
-            run_with_timeout "${LINAK_CONTROLLER}" --move-to "$1"
+    local cmd="$1"
+    local flag="${2:-}"
+
+    case "${cmd}" in
+        connect)
+            start_server
+            ;;
+        disconnect)
+            stop_server
+            ;;
+        stand)
+            if [[ "${flag}" == "--save" ]]; then
+                local current_height
+                current_height=$(get_current_height) || { echo "Failed to get current height" >&2; exit 1; }
+                save_height "STANDING" "${current_height}"
+            else
+                move_to_height "${STANDING_HEIGHT}"
+            fi
+            ;;
+        sit)
+            if [[ "${flag}" == "--save" ]]; then
+                local current_height
+                current_height=$(get_current_height) || { echo "Failed to get current height" >&2; exit 1; }
+                save_height "SITTING" "${current_height}"
+            else
+                move_to_height "${SITTING_HEIGHT}"
+            fi
             ;;
         status)
             # Only log if at office desk
@@ -144,9 +397,18 @@ main() {
                 echo "Screen is locked, logging as Away (0mm)"
                 height=0
             else
-                local output
-                output=$(run_with_timeout "${LINAK_CONTROLLER}" 2>&1)
-                height=$(extract_height "${output}")
+                local output height retries=3
+                for ((i=1; i<=retries; i++)); do
+                    output=$(run_with_timeout "${LINAK_CONTROLLER}" --mac-address "${DESK_MAC}" 2>&1) || true
+                    height=$(extract_height "${output}")
+                    if [[ -n "${height}" ]]; then
+                        break
+                    fi
+                    if [[ $i -lt $retries ]]; then
+                        echo "Retry $i/$retries - connection failed, waiting..." >&2
+                        sleep 2
+                    fi
+                done
             fi
 
             if [[ -n "${height}" ]]; then
