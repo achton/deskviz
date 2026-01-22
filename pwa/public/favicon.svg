@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4361ee"/>
+      <stop offset="100%" style="stop-color:#7209b7"/>
+    </linearGradient>
+  </defs>
+  <!-- Desk legs -->
+  <rect x="4" y="10" width="3" height="18" rx="1.5" fill="url(#grad)"/>
+  <rect x="25" y="10" width="3" height="18" rx="1.5" fill="url(#grad)"/>
+  <!-- Desk surface -->
+  <rect x="2" y="8" width="28" height="4" rx="2" fill="url(#grad)"/>
+  <!-- Arrow indicator -->
+  <path d="M16 4 L12 8 L14 8 L14 6 L18 6 L18 8 L20 8 Z" fill="#f72585"/>
+</svg>
+
