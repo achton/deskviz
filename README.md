@@ -48,9 +48,85 @@ This works cross-platform (Linux and macOS) and prevents logging when working fr
 
 Additionally, when the screen is locked, the script logs an "away" state (0mm) instead of the actual desk height. Screen lock is detected via DBus on Linux (GNOME, KDE, etc.) and Quartz on macOS.
 
-### Automated Logging
+### Automated Logging (Linux)
 
-Use a systemd timer (Linux) or launchd (macOS) to run `desk.sh status` periodically (e.g., every 10 minutes).
+Use a systemd user timer to run `desk.sh status` periodically.
+
+**1. Create the service file** (`~/.config/systemd/user/desk-status.service`):
+
+```ini
+[Unit]
+Description=Log desk height to CSV
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/desk status
+```
+
+**2. Create the timer file** (`~/.config/systemd/user/desk-status.timer`):
+
+```ini
+[Unit]
+Description=Log desk height every 10 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+```
+
+**3. Enable and start the timer:**
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now desk-status.timer
+```
+
+**4. Check status:**
+
+```bash
+systemctl --user status desk-status.timer
+systemctl --user list-timers
+```
+
+**5. Disable the timer:**
+
+```bash
+systemctl --user disable --now desk-status.timer
+```
+
+Note: The service assumes `desk.sh` is symlinked to `~/bin/desk`. Adjust the `ExecStart` path if your setup differs.
+
+### Automated Logging (macOS)
+
+Use launchd to run `desk.sh status` periodically. Create `~/Library/LaunchAgents/com.user.desk-status.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.desk-status</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>$HOME/bin/desk status</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>600</integer>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+```
+
+**Enable:** `launchctl load ~/Library/LaunchAgents/com.user.desk-status.plist`
+
+**Disable:** `launchctl unload ~/Library/LaunchAgents/com.user.desk-status.plist`
 
 ## Visualization
 
